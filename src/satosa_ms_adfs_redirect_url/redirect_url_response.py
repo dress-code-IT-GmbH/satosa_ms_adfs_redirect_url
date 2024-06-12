@@ -4,7 +4,7 @@ from satosa.micro_services.base import ResponseMicroService
 from satosa_cls_redis_store import LocalStore
 import copy
 from satosa.context import Context
-from .definitions import STATE_KEY, RelayStateMissingException
+from .definitions import STATE_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -25,53 +25,47 @@ class RedirectUrlResponse(ResponseMicroService):
         self.self_entityid = config['self_entityid']
         self.redir_attr = config['redirect_attr_name']
         self.redir_entityid = config['redir_entityid']
+        self.backends = config['backends']
         self.local_store = LocalStore(config['db_encryption_key'], redishost=config.get('redis_host', 'localhost'))
-        logging.info('RedirectUrlResponse microservice active')
+        logger.info('RedirectUrlResponse microservice active')
 
-    def _load_stored_authnrequest_context(self, context, need_relay_state=True):
+    def _load_stored_authnrequest_context(self, context):
         key = int(context.state[STATE_KEY])
+        logger.info(f"Loading authnrequest context from key: {key}")
         stored_context_json = self.local_store.get(key)
         stored_request_context = Context.from_json(context.wsgi_app, stored_context_json)
-        logging.debug(f"Loading context from {key}: {stored_request_context}")
-        if need_relay_state:
-            try:
-                logger.info(f"Loaded context {key} has saml2 relay state: {stored_request_context.state['saml2']['relay_state']}")
-            except KeyError:
-                raise RelayStateMissingException(f"Loaded context {key} has no saml2 relay state")
+        logger.debug(f"Authnrequest content from key {key}: {stored_request_context.state}")
         return stored_request_context
 
-    @staticmethod
-    def _copy_relay_state_from(context_src, context_dst):
-        logging.info(f"updating saml2 relay state "
-                     f"{context_dst.state['saml2']['relay_state']} with "
-                     f"{context_src.state['saml2']['relay_state']}")
-        context_dst.state['saml2'] = copy.deepcopy(context_src.state['saml2'])
+    def _copy_relay_state_from(self, context_src, context_dst):
+        backends_updated = []
+        for backend in self.backends:
+            try:
+                context_dst.state[backend] = copy.deepcopy(context_src.state[backend])
+                backends_updated.append(backend)
+            except KeyError:
+                pass
+        return backends_updated
 
     def _handle_redirecturl_response(self, context):
         authn_request_context = self._load_stored_authnrequest_context(context)
 
-        logging.debug("Starting replay with authn request context")
+        logger.debug("Starting replay with authn request context")
         wsgi_result = context.wsgi_app.run(authn_request_context)
 
-        self._copy_relay_state_from(authn_request_context, context)
+        backends_updated = self._copy_relay_state_from(authn_request_context, context)
+        logger.info(f"updated redirect response relay state for backends: {backends_updated}")
 
         return wsgi_result
 
     def process(self, context, internal_response):
         if self.redir_attr not in internal_response.attributes:
-            logging.debug(f"RedirectUrl microservice: Attribute {self.redir_attr} not found: Skipping redirect.")
+            logger.info(f"Testing for Attribute {self.redir_attr}: Attribute not found: Skipping redirect.")
             return super().process(context, internal_response)
+        logger.info(f"Testing for Attribute {self.redir_attr}: Attribute found: Redirecting")
 
-        logging.debug(f"RedirectUrl microservice: Attribute {self.redir_attr} found: Redirecting.")
         redirecturl = internal_response.attributes[self.redir_attr][0] + '?wtrealm=' + self.self_entityid
-
-        try:
-            authn_request_context = self._load_stored_authnrequest_context(context)
-            self._copy_relay_state_from(authn_request_context, context)
-        except RelayStateMissingException:
-            logging.error(f"Redirect Attribute {self.redir_attr} found, but no relay state: Skipping redirect.")
-            return super().process(context, internal_response)
-
+        logger.info(f"redirect to {redirecturl}")
         return satosa.response.Redirect(redirecturl)
 
     def register_endpoints(self):
